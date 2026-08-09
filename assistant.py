@@ -13,7 +13,7 @@ from prompts import _REVIEW_PROMPT, _SYSTEM_PROMPT, _TOOLS
 logger = logging.getLogger(__name__)
 
 _MAX_TOOL_ITERS = 25
-_MAX_PAGES_PER_CALL = 10
+_MAX_PAGES_PER_CALL = 30
 
 _WIND_DOWN_PROHIBITIONS = [
     "На основе всей полученной информации напиши ответ пользователю. Не вызывай инструменты.",
@@ -76,17 +76,18 @@ class MiniAssistant:
 
     def _call_tool(self, name: str, args: dict) -> str:
         if name == "list_documents":
-            logger.info("tool_call list_documents")
-            return self.archive.list_text()
+            logger.info("tool_call list_documents query=%r doc_code=%r", args.get("query"), args.get("doc_code"))
+            return self.archive.list_text(query=args.get("query"), doc_code=args.get("doc_code"))
 
         if name == "toc_navigate":
             doc = self.archive.get(int(args.get("document_id")))
             if doc is None:
                 return "Документ с таким номером не найден. Вызови list_documents для получения перечня."
-            node_id = args.get("node_id")
-            logger.info("tool_call toc_navigate document_id=%s node_id=%s", doc.number, node_id)
-            return doc.navigate(int(node_id) if node_id is not None else None,
-                                max_nodes=self.settings.max_toc_nodes)
+            clause = args.get("clause")
+            depth = int(args.get("depth") or 1)
+            logger.info("tool_call toc_navigate document_id=%s clause=%s depth=%s", doc.number, clause, depth)
+            return doc.navigate(str(clause).strip() if clause else None,
+                                depth=depth, max_nodes=self.settings.max_toc_nodes)
 
         if name == "get_pages_by_clause":
             doc = self.archive.get(int(args.get("document_id")))

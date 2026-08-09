@@ -24,8 +24,8 @@ class Settings:
     base_url: str = field(default_factory=lambda: os.getenv("OPENAI_BASE_URL", ""))
     model: str = field(default_factory=lambda: os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
     max_tool_iters: int = 25
-    max_pages_per_call: int = 10
-    max_toc_nodes: int = 60
+    max_pages_per_call: int = 30
+    max_toc_nodes: int = 300
 
 
 def get_settings() -> Settings:

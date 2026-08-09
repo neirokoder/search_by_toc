@@ -181,37 +181,63 @@ class Document:
                 parts.append(f"===== Документ №{self.number}, стр. {p} =====\n{content}")
         return "\n\n".join(parts)
 
-    def navigate(self, node_id: int | None, max_nodes: int = 60) -> str:
-        """Форматированное содержание: верхний уровень или дети узла node_id.
-        Каждая строка содержит номер пункта (clause), уровень и страницы."""
-        if node_id is None:
-            nodes = self.tree()
+    def navigate(self, clause: str | None = None, depth: int = 1, max_nodes: int = 300) -> str:
+        """Форматированное содержание. clause — номер пункта для раскрытия
+        (без него — с верхнего уровня); depth — сколько уровней вложенности
+        показать (по умолчанию 1). Один уровень выводится полностью;
+        лимит max_nodes (строк) применяется только при вложенных уровнях (depth > 1).
+        Номер пункта может повторяться в разных разделах — каждое совпадение
+        выводится отдельно с указанием раздела."""
+        counter = [0, False] if depth > 1 else None
+        if not clause:
             prefix = f"Содержание документа №{self.number} «{self.title}» ({self.pages_count} стр.).\n"
-            return prefix + self._format_nodes(nodes, max_nodes)
-        node = next((n for n in self.flat_nodes() if n.node_id == node_id), None)
-        if node is None:
-            return f"Узел id={node_id} не найден. Вызови навигацию без node_id для просмотра верхнего уровня."
-        prefix = self._format_node(node) + "\n"
-        if not node.children:
-            return prefix + "Вложенных подразделов нет."
-        return prefix + self._format_nodes(node.children, max_nodes, indent="  ")
+            lines = self._format_levels(self.tree(), depth, max_nodes, counter=counter)
+            if counter and counter[1]:
+                lines.append(f"... и ещё строк (лимит {max_nodes}); уточни пункт или запроси меньшую глубину")
+            return prefix + "\n".join(lines)
+        matches = self._find_clause(clause.strip())
+        if not matches:
+            return f"Пункт {clause} не найден в содержании документа №{self.number}. Вызови навигацию без clause для просмотра верхнего уровня."
+        lines: list[str] = []
+        for n in matches:
+            if counter and counter[0] >= max_nodes:
+                counter[1] = True
+                break
+            section = self._section_path(n)
+            where = f" (раздел «{section}»)" if section else ""
+            lines.append(self._format_node(n) + where)
+            if counter:
+                counter[0] += 1
+            if n.children and depth > 1:
+                lines.extend(self._format_levels(n.children, depth - 1, max_nodes, indent="  ", counter=counter))
+        if counter and counter[1]:
+            lines.append(f"... и ещё строк (лимит {max_nodes}); уточни пункт или запроси меньшую глубину")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_levels(nodes: list[TocNode], depth: int, max_nodes: int,
+                       indent: str = "", counter: list[int] | None = None) -> list[str]:
+        """Строки дерева до глубины depth. При depth == 1 (counter=None)
+        вывод полный; при вложенных уровнях — общий лимит max_nodes строк."""
+        lines: list[str] = []
+        for n in nodes:
+            if counter is not None and counter[0] >= max_nodes:
+                counter[1] = True
+                break
+            lines.append(indent + Document._format_node(n))
+            if counter is not None:
+                counter[0] += 1
+            if n.children and depth > 1:
+                lines.extend(Document._format_levels(n.children, depth - 1, max_nodes,
+                                                     indent + "  ", counter))
+        return lines
 
     @staticmethod
     def _format_node(n: TocNode) -> str:
         rng = f"{n.page_start}–{n.page_end}" if n.page_end > n.page_start else str(n.page_start)
-        clause = f"{n.clause} " if n.clause else ""
+        clause = f"п.{n.clause} " if n.clause else ""
         marker = " ▸" if n.children else ""
-        return f"id={n.node_id} {clause}{n.title} — стр. {rng}{marker}"
-
-    @staticmethod
-    def _format_nodes(nodes: list[TocNode], max_nodes: int, indent: str = "") -> str:
-        lines = []
-        for i, n in enumerate(nodes):
-            if i >= max_nodes:
-                lines.append(f"{indent}... и ещё {len(nodes) - max_nodes} узлов (укажи конкретный id для раскрытия)")
-                break
-            lines.append(indent + Document._format_node(n))
-        return "\n".join(lines)
+        return f"{clause}{n.title} — стр. {rng}{marker}"
 
     def pages_by_clause(self, clauses: list[str]) -> str:
         """Страницы, содержащие пункты с указанными номерами (clause).
@@ -264,8 +290,21 @@ class Archive:
         self.documents()
         return self._docs.get(number)
 
-    def list_text(self) -> str:
+    def list_text(self, query: str | None = None, doc_code: str | None = None) -> str:
+        """Перечень документов. query — ключевые слова по названию (все слова),
+        doc_code — подстрока кода документа (например 174-1)."""
+        docs = self.documents()
+        q = (query or "").strip().lower()
+        code = (doc_code or "").strip().lower()
+        if q or code:
+            docs = [
+                d for d in docs
+                if (not q or all(w in (d.title + " " + d.doc_code).lower() for w in q.split()))
+                and (not code or code in (d.doc_code + " " + d.zip_path.stem).lower())
+            ]
+        if not docs:
+            return "Документы по запросу не найдены."
         lines = []
-        for d in self.documents():
+        for d in docs:
             lines.append(f"№{d.number} — {d.doc_code} «{d.title}» ({d.pages_count} стр.)")
         return "\n".join(lines)
