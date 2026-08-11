@@ -108,18 +108,24 @@ class MiniAssistant:
             if doc is None:
                 return "Документ с таким номером не найден. Вызови list_documents для получения перечня."
             clause = args.get("clause")
-            depth = int(args.get("depth") or 1)
+            depth = int(args.get("depth") or 2)
             logger.info("tool_call toc_navigate document_id=%s clause=%s depth=%s", doc.number, clause, depth)
             return doc.navigate(str(clause).strip() if clause else None,
                                 depth=depth, max_nodes=self.settings.max_toc_nodes)
 
         if name == "get_pages_by_clause":
-            doc = self.archive.get(int(args.get("document_id")))
-            if doc is None:
-                return "Документ с таким номером не найден. Вызови list_documents для получения перечня."
-            clauses = [str(c) for c in (args.get("clauses") or [])]
-            logger.info("tool_call get_pages_by_clause document_id=%s clauses=%s", doc.number, clauses)
-            return doc.pages_by_clause(clauses)
+            reqs = args.get("requests") or [{"document_id": args.get("document_id"),
+                                             "clauses": args.get("clauses") or []}]
+            logger.info("tool_call get_pages_by_clause requests=%s", reqs)
+            parts = []
+            for req in reqs:
+                doc = self.archive.get(int(req.get("document_id")))
+                if doc is None:
+                    parts.append("Документ с номером %s не найден. Вызови list_documents для получения перечня." % req.get("document_id"))
+                    continue
+                clauses = [str(c) for c in (req.get("clauses") or [])]
+                parts.append(doc.pages_by_clause(clauses))
+            return "\n\n".join(parts)
 
         if name == "get_page_markdown":
             doc = self.archive.get(int(args.get("document_id")))
