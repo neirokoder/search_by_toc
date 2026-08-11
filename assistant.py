@@ -3,12 +3,13 @@
 import json
 import logging
 import re
+import time
 
 from openai import OpenAI
 
 from archive import Archive
 from config import Settings
-from prompts import _REVIEW_PROMPT, _SYSTEM_PROMPT, _TOOLS
+from prompts import _DRAFT_PROMPT, _REVIEW_PROMPT, _SYSTEM_PROMPT, _TOOLS, _VERIFY_PROMPT
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,29 @@ class MiniAssistant:
         self.llm = OpenAI(**kwargs)
         self.model = settings.model
         self.history: list[dict] = []
+        self._last_llm_at: float | None = None
+
+    def _complete(self, messages: list[dict], tools=None, tool_choice=None, retries: int = 4):
+        """Вызов LLM с паузой между запросами и повторами при сбоях/rate limit."""
+        now = time.monotonic()
+        if self._last_llm_at is not None:
+            wait = self.settings.llm_pause_seconds - (now - self._last_llm_at)
+            if wait > 0:
+                time.sleep(wait)
+        self._last_llm_at = time.monotonic()
+        for attempt in range(retries + 1):
+            try:
+                return self.llm.chat.completions.create(
+                    model=self.model, messages=messages, tools=tools, tool_choice=tool_choice
+                )
+            except Exception as exc:
+                last = attempt == retries
+                if last:
+                    raise
+                wait = 10 * (attempt + 1)
+                logger.warning("llm call failed (%s: %s), retry %d/%d in %ds",
+                               type(exc).__name__, str(exc)[:120], attempt + 1, retries, wait)
+                time.sleep(wait)
 
     def _system_prompt(self) -> str:
         docs_text = self.archive.list_text()
@@ -113,10 +137,10 @@ class MiniAssistant:
     def _run_tool_loop(self, messages: list[dict]) -> str:
         for i in range(_MAX_TOOL_ITERS):
             print(f"  ▸ итерация {i + 1}: анализ...", flush=True)
-            response = self.llm.chat.completions.create(
-                model=self.model, messages=messages, tools=_TOOLS
-            )
+            response = self._complete(messages, tools=_TOOLS)
             msg = response.choices[0].message
+            if msg.content:
+                print(f"  ▸ план: {msg.content.strip()[:300]}", flush=True)
             if not msg.tool_calls:
                 content = msg.content or ""
                 if _is_garbage(content) or _PLAN_ONLY_RE.match(content):
@@ -134,6 +158,8 @@ class MiniAssistant:
                 args = json.loads(tc.function.arguments or "{}")
                 print(f"  ▸ вызов {fn}({json.dumps(args, ensure_ascii=False)[:120]})", flush=True)
                 tool_content = self._call_tool(fn, args)
+                preview = " ".join(tool_content.split())[:400]
+                print(f"  ▸ результат: {preview}", flush=True)
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
@@ -144,9 +170,7 @@ class MiniAssistant:
     def _wind_down(self, messages: list[dict]) -> str:
         for attempt, prohibition in enumerate(_WIND_DOWN_PROHIBITIONS):
             print(f"  ▸ формирование ответа (попытка {attempt + 1}/{len(_WIND_DOWN_PROHIBITIONS)})...", flush=True)
-            response = self.llm.chat.completions.create(
-                model=self.model, messages=messages, tools=_TOOLS, tool_choice="none"
-            )
+            response = self._complete(messages, tools=_TOOLS, tool_choice="none")
             content = (response.choices[0].message.content or "").strip()
             if content and not _is_garbage(content) and not _PLAN_ONLY_RE.match(content):
                 return content
@@ -158,9 +182,7 @@ class MiniAssistant:
             return answer
         try:
             review_messages = list(messages) + [{"role": "user", "content": _REVIEW_PROMPT}]
-            response = self.llm.chat.completions.create(
-                model=self.model, messages=review_messages, tools=_TOOLS
-            )
+            response = self._complete(review_messages, tools=_TOOLS)
             content = (response.choices[0].message.content or "").strip()
             if (content and not _is_garbage(content)
                     and "изменений не требуется" not in content.lower()
@@ -173,10 +195,18 @@ class MiniAssistant:
     def run(self, user_query: str) -> str:
         messages = [{"role": "system", "content": self._system_prompt()}]
         messages.extend(self.history)
-        messages.append({
-            "role": "user",
-            "content": f"Сообщение пользователя:\n{user_query}",
-        })
+
+        # Шаг 1: полный ответ по знаниям, без инструментов и документов
+        print("▸ Шаг 1: черновой ответ на основе знаний (без документов)...", flush=True)
+        messages.append({"role": "user", "content": _DRAFT_PROMPT + f"\n\nВопрос:\n{user_query}"})
+        draft_resp = self._complete(messages, tools=None)
+        draft = (draft_resp.choices[0].message.content or "").strip()
+        print(f"▸ Черновик:\n{draft}\n", flush=True)
+        messages.append({"role": "assistant", "content": draft})
+
+        # Шаг 2: план + сверка с документами через инструменты
+        print("▸ Шаг 2: план и сверка с документами...", flush=True)
+        messages.append({"role": "user", "content": _VERIFY_PROMPT})
         answer = self._run_tool_loop(messages)
         if not answer:
             answer = self._wind_down(messages)

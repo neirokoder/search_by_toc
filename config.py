@@ -26,6 +26,7 @@ class Settings:
     max_tool_iters: int = 25
     max_pages_per_call: int = 30
     max_toc_nodes: int = 300
+    llm_pause_seconds: float = 1.0
 
 
 def get_settings() -> Settings:
