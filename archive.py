@@ -119,6 +119,15 @@ class Document:
         return m.group(1).strip() if m else raw[:120].strip()
 
     @property
+    def part_label(self) -> str:
+        """Заголовок книги: 'части I «Классификация»' из metadata.title."""
+        raw = self.meta.get("title") or ""
+        m = re.search(r"части\s+([IVXLCDM]+)\s*«([^»]+)»", raw, re.IGNORECASE)
+        if m:
+            return f"часть {m.group(1)} «{m.group(2).strip()}»"
+        return self.title
+
+    @property
     def pages_count(self) -> int:
         return self._pages_count_raw or max(p.page_end for p in self.flat_nodes())
 
@@ -161,7 +170,51 @@ class Document:
         return parts[0] if parts else ""
 
     def _find_clause(self, clause: str) -> list[TocNode]:
+        clause = clause.rstrip(".")
         return [n for n in self.flat_nodes() if n.clause == clause]
+
+    def _find_clause_in_pages(self, clause: str) -> list[tuple[int, str]]:
+        """Поиск номера пункта в тексте страниц, когда пункт отсутствует в
+        оглавлении (неполная разметка toc). Ищется номер в НАЧАЛЕ абзаца
+        (заголовок пункта), а не упоминания-ссылки в тексте."""
+        clause = clause.rstrip(".")
+        pat = re.compile(rf"(?m)^\s*(?:\*\s*)?{re.escape(clause)}(?![\d.])([^\n]*)")
+        hits: list[tuple[int, str]] = []
+        with zipfile.ZipFile(self.zip_path) as zf:
+            names = sorted(n for n in zf.namelist() if n.startswith("pages/") and n.endswith(".md"))
+            for name in names:
+                page = int(name[len("pages/"):-len(".md")])
+                txt = zf.read(name).decode("utf-8", errors="replace")
+                m = pat.search(txt)
+                if m:
+                    hits.append((page, m.group(1).strip(" -")))
+        return hits
+
+    def _clause_span_in_pages(self, clause: str) -> tuple[int, int, str] | None:
+        """Диапазон страниц пункта, найденного в тексте (fallback при неполном
+        оглавлении): от страницы с заголовком пункта до страницы перед
+        следующим заголовком пункта. Возвращает (первая, последняя, заголовок)."""
+        hits = self._find_clause_in_pages(clause)
+        if not hits:
+            return None
+        start = hits[0][0]
+        title = hits[0][1]
+        end = start
+        next_head = re.compile(r"(?m)^\s*(?:\*\s*)?(\d+(?:\.\d+)+)(?![\d.])([^\n]*)")
+        with zipfile.ZipFile(self.zip_path) as zf:
+            names = sorted(n for n in zf.namelist() if n.startswith("pages/") and n.endswith(".md"))
+            for name in names:
+                page = int(name[len("pages/"):-len(".md")])
+                if page <= start:
+                    continue
+                if page > end + 1:
+                    break
+                txt = zf.read(name).decode("utf-8", errors="replace")
+                m = next_head.search(txt)
+                if m and not m.group(1).startswith(clause + "."):
+                    break
+                end = page
+        return start, end, title
 
     def get_page(self, page: int) -> str | None:
         name = f"pages/{page:03d}.md"
@@ -181,38 +234,82 @@ class Document:
                 parts.append(f"===== Документ №{self.number}, стр. {p} =====\n{content}")
         return "\n\n".join(parts)
 
+    def _section_root(self, node: TocNode) -> TocNode | None:
+        """Узел раздела (уровень 1), в котором находится узел, или None."""
+        cur = node
+        seen = 0
+        while cur is not None and seen < 100:
+            if cur.level == 1:
+                return cur
+            cur = self._parent.get(cur.node_id)
+            seen += 1
+        return None
+
+    def _format_clause_matches(self, matches: list[TocNode], clause: str,
+                               depth: int, max_nodes: int,
+                               counter: list[int] | None) -> list[str]:
+        """Строки для найденных пунктов: каждый пункт выводится внутри своего
+        раздела (заголовок раздела один на группу), а не с пометкой на строке."""
+        groups: dict[int, list[TocNode]] = {}
+        for n in matches:
+            root = self._section_root(n)
+            key = root.node_id if root else id(n)
+            groups.setdefault(key, []).append(n)
+        lines: list[str] = []
+        for nodes in groups.values():
+            if counter is not None and counter[0] >= max_nodes:
+                counter[1] = True
+                break
+            root = self._section_root(nodes[0])
+            if root and not (len(nodes) == 1 and nodes[0] is root):
+                lines.append(self._format_node(root))
+                if counter is not None:
+                    counter[0] += 1
+            for n in nodes:
+                if counter is not None and counter[0] >= max_nodes:
+                    counter[1] = True
+                    break
+                indent = "  " if root and not (len(nodes) == 1 and nodes[0] is root) else ""
+                lines.append(indent + self._format_node(n))
+                if counter is not None:
+                    counter[0] += 1
+                if n.children and depth > 1:
+                    lines.extend(self._format_levels(n.children, depth - 1, max_nodes,
+                                                     indent=indent + "  ", counter=counter))
+        return lines
+
     def navigate(self, clause: str | None = None, depth: int = 1, max_nodes: int = 300) -> str:
         """Форматированное содержание. clause — номер пункта для раскрытия
         (без него — с верхнего уровня); depth — сколько уровней вложенности
         показать (по умолчанию 1). Один уровень выводится полностью;
         лимит max_nodes (строк) применяется только при вложенных уровнях (depth > 1).
         Номер пункта может повторяться в разных разделах — каждое совпадение
-        выводится отдельно с указанием раздела."""
+        выводится внутри своего раздела с заголовком раздела сверху."""
         counter = [0, False] if depth > 1 else None
         if not clause:
-            prefix = f"Содержание документа №{self.number} «{self.title}» ({self.pages_count} стр.).\n"
+            prefix = f"Документ №{self.number} — {self.part_label} ({self.pages_count} стр.).\n"
             lines = self._format_levels(self.tree(), depth, max_nodes, counter=counter)
             if counter and counter[1]:
                 lines.append(f"... и ещё строк (лимит {max_nodes}); уточни пункт или запроси меньшую глубину")
             return prefix + "\n".join(lines)
         matches = self._find_clause(clause.strip())
         if not matches:
-            return f"Пункт {clause} не найден в содержании документа №{self.number}. Вызови навигацию без clause для просмотра верхнего уровня."
+            span = self._clause_span_in_pages(clause.strip())
+            if span:
+                start, end, title = span
+                rng = f"стр. {start}–{end}" if end > start else f"стр. {start}"
+                return f"Документ №{self.number} — {self.part_label} ({self.pages_count} стр.).\n{clause} {title} — {rng}"
+            return (f"Документ №{self.number} — {self.part_label} ({self.pages_count} стр.).\n"
+                    f"Пункт {clause} не найден в содержании документа №{self.number}. "
+                    "Вызови навигацию без clause для просмотра верхнего уровня.")
         lines: list[str] = []
-        for n in matches:
-            if counter and counter[0] >= max_nodes:
-                counter[1] = True
-                break
-            section = self._section_path(n)
-            where = f" (раздел «{section}»)" if section else ""
-            lines.append(self._format_node(n) + where)
-            if counter:
-                counter[0] += 1
-            if n.children and depth > 1:
-                lines.extend(self._format_levels(n.children, depth - 1, max_nodes, indent="  ", counter=counter))
+        if len(matches) == 1 and matches[0].level == 1 and depth == 1:
+            lines.append(self._format_node(matches[0]))
+        else:
+            lines = self._format_clause_matches(matches, clause, depth, max_nodes, counter)
         if counter and counter[1]:
             lines.append(f"... и ещё строк (лимит {max_nodes}); уточни пункт или запроси меньшую глубину")
-        return "\n".join(lines)
+        return f"Документ №{self.number} — {self.part_label} ({self.pages_count} стр.).\n" + "\n".join(lines)
 
     @staticmethod
     def _format_levels(nodes: list[TocNode], depth: int, max_nodes: int,
@@ -235,7 +332,7 @@ class Document:
     @staticmethod
     def _format_node(n: TocNode) -> str:
         rng = f"{n.page_start}–{n.page_end}" if n.page_end > n.page_start else str(n.page_start)
-        clause = f"п.{n.clause} " if n.clause else ""
+        clause = f"{n.clause} " if n.clause else ""
         marker = " ▸" if n.children else ""
         return f"{clause}{n.title} — стр. {rng}{marker}"
 
@@ -253,6 +350,15 @@ class Document:
         for c in clauses:
             matches = self._find_clause(c)
             if not matches:
+                span = self._clause_span_in_pages(c)
+                if span:
+                    start, end, title = span
+                    shown_end = min(end, start + _PER_CLAUSE_MAX_PAGES - 1)
+                    rng = f"{start}–{shown_end}" if shown_end > start else str(start)
+                    note = f"; всего стр. {end - start + 1}, показаны первые {_PER_CLAUSE_MAX_PAGES}" if end - start + 1 > _PER_CLAUSE_MAX_PAGES else ""
+                    header.append(f"{c} «{title}» — стр. {rng}{note}")
+                    pages.update(range(start, shown_end + 1))
+                    continue
                 header.append(f"Пункт {c} не найден в содержании документа №{self.number}.")
                 continue
             for n in matches:
@@ -262,7 +368,7 @@ class Document:
                 section = self._section_path(n)
                 where = f" (раздел «{section}»)" if section else ""
                 note = f"; всего стр. {span}, показаны первые {_PER_CLAUSE_MAX_PAGES}" if span > _PER_CLAUSE_MAX_PAGES else ""
-                header.append(f"п.{c} «{n.title}» — стр. {rng}{where}{note}")
+                header.append(f"{c} «{n.title}» — стр. {rng}{where}{note}")
                 pages.update(range(n.page_start, shown_end + 1))
         if not pages:
             return "\n".join(header)

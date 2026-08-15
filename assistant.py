@@ -80,10 +80,17 @@ class MiniAssistant:
             if wait > 0:
                 time.sleep(wait)
         self._last_llm_at = time.monotonic()
+        extra_body: dict | None = None
+        if self.settings.llm_provider_only.strip():
+            try:
+                extra_body = {"provider": {"only": json.loads(self.settings.llm_provider_only)}}
+            except json.JSONDecodeError:
+                logger.warning("LLM_PROVIDER_ONLY не является JSON-массивом, поле provider не передаётся")
         for attempt in range(retries + 1):
             try:
                 return self.llm.chat.completions.create(
-                    model=self.model, messages=messages, tools=tools, tool_choice=tool_choice
+                    model=self.model, messages=messages, tools=tools,
+                    tool_choice=tool_choice, extra_body=extra_body,
                 )
             except Exception as exc:
                 last = attempt == retries
@@ -104,14 +111,21 @@ class MiniAssistant:
             return self.archive.list_text(query=args.get("query"), doc_code=args.get("doc_code"))
 
         if name == "toc_navigate":
-            doc = self.archive.get(int(args.get("document_id")))
-            if doc is None:
-                return "Документ с таким номером не найден. Вызови list_documents для получения перечня."
-            clause = args.get("clause")
-            depth = int(args.get("depth") or 2)
-            logger.info("tool_call toc_navigate document_id=%s clause=%s depth=%s", doc.number, clause, depth)
-            return doc.navigate(str(clause).strip() if clause else None,
-                                depth=depth, max_nodes=self.settings.max_toc_nodes)
+            reqs = args.get("requests") or [{"document_id": args.get("document_id"),
+                                              "clause": args.get("clause"),
+                                              "depth": args.get("depth")}]
+            logger.info("tool_call toc_navigate requests=%s", reqs)
+            parts = []
+            for req in reqs:
+                doc = self.archive.get(int(req.get("document_id")))
+                if doc is None:
+                    parts.append("Документ с номером %s не найден. Вызови list_documents для получения перечня." % req.get("document_id"))
+                    continue
+                clause = req.get("clause")
+                depth = int(req.get("depth") or 2)
+                parts.append(doc.navigate(str(clause).strip() if clause else None,
+                                          depth=depth, max_nodes=self.settings.max_toc_nodes))
+            return "\n\n".join(parts)
 
         if name == "get_pages_by_clause":
             reqs = args.get("requests") or [{"document_id": args.get("document_id"),

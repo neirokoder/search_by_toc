@@ -27,6 +27,7 @@ class Settings:
     max_pages_per_call: int = 30
     max_toc_nodes: int = 300
     llm_pause_seconds: float = 1.0
+    llm_provider_only: str = field(default_factory=lambda: os.getenv("LLM_PROVIDER_ONLY", ""))
 
 
 def get_settings() -> Settings:
